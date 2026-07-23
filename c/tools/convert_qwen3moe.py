@@ -1,24 +1,41 @@
 #!/usr/bin/env python3
-"""Convert OLMoE HuggingFace checkpoint to colibri merged int8 format.
+"""Convert a Qwen3-MoE (e.g. Qwen/Qwen3-30B-A3B) HuggingFace checkpoint to
+colibri's merged int4/int8 format, readable by qwen3moe.c.
 
-Consolidates gate_proj, up_proj, and down_proj into a single merged tensor per expert.
-This allows olmoe.c to load an expert in a single disk read call instead of 3.
+DISK-SAFE strategy (same discipline as convert_fp8_to_int4.py's GLM converter):
+with --repo, download ONE source shard at a time, extract whatever it holds,
+delete it, move to the next. Peak extra disk usage is one source shard (a few
+GB) plus the growing quantized output -- never the full ~60GB bf16 checkpoint.
 
-DISK/RAM-SAFE: with --repo, source shards are downloaded and processed ONE AT A
-TIME (deleted immediately after extraction) instead of pulling the whole
-checkpoint via snapshot_download and loading every shard fully into RAM at
-once. Peak extra disk usage is one source shard, not the full checkpoint;
-peak extra RAM is bounded by in-flight partial experts (an expert whose three
-projections happen to land in different shards), not the whole state dict.
-Resumable: existing output shards are scanned (header only) and already-done
-tensors are skipped on a rerun.
+Wrinkle vs. the GLM converter: colibri merges each expert's gate_proj/up_proj/
+down_proj into a single blob (one pread instead of three at inference time),
+but HuggingFace shards experts by parameter-count balance, not by expert
+identity -- a given expert's three projections can land in three different
+shard files. So instead of converting each shard fully independently, this
+script accumulates partial experts across shards (kept in RAM only until their
+triple completes -- a few MB each) and flushes a completed expert as soon as
+its last projection arrives; the input shard is deleted as soon as everything
+needed from it has been read, regardless of whether it completed any experts.
+
+q_norm.weight / k_norm.weight (per-head RMSNorm, shape [head_dim]) pass through
+UNQUANTIZED, exactly like input_layernorm.weight -- they must never be caught
+by the expert regex or run through quantize_row.
+
+Resumable: every output shard already on disk is scanned (header only, via
+safe_open) before starting, and any tensor already present there is skipped —
+rerunning after an interruption only redoes missing work, like
+convert_fp8_to_int4.py's out-NNNNN.safetensors resume.
 
 Usage:
-  python tools/convert_olmoe_merged.py --repo allenai/OLMoE-1B-7B-0125-Instruct --out ./olmoe_merged
-  python tools/convert_olmoe_merged.py --model ./OLMoE-1B-7B-0125-Instruct --out ./olmoe_merged
+  # local/pre-downloaded checkpoint (also what the tiny bench fixture uses)
+  python tools/convert_qwen3moe.py --model ./qwen3moe_bench --out ./qwen3moe_bench_i8 --bits 8
+
+  # real checkpoint: streams+deletes shard by shard, resumable
+  python tools/convert_qwen3moe.py --repo Qwen/Qwen3-30B-A3B --out /nvme/qwen3moe_i4 --bits 4
 """
 
 import argparse
+import json
 import re
 import shutil
 import sys
@@ -29,11 +46,12 @@ try:
     from safetensors import safe_open
     from safetensors.torch import save_file
 except ImportError as exc:
-    sys.exit(f"Missing dependencies: {exc}. Install: pip install torch safetensors huggingface_hub")
+    sys.exit(f"Missing dependencies: {exc}. Install: pip install torch safetensors")
 
 EXPERT_KEY_RE = re.compile(
     r"model\.layers\.(\d+)\.mlp\.experts\.(\d+)\.(gate_proj|up_proj|down_proj)\.weight"
 )
+# tensors an inference engine never needs: training-only bookkeeping, if present.
 SKIP_KEY_RE = re.compile(r"\.e_score_correction_bias$|^model\.rotary_emb\.")
 
 TOKENIZER_FILES = (
@@ -42,12 +60,14 @@ TOKENIZER_FILES = (
 )
 
 
-def quantize_row(w: "torch.Tensor") -> tuple:
-    """Row-wise int8 quantization, identical math to olmoe.c's quantize_rows()."""
+def quantize_row(w: "torch.Tensor", bits: int) -> tuple:
+    """Row-wise symmetric quantization, identical math to qwen3moe.c's
+    quantize_rows(): scale = amax(|row|)/qmax, q = round(w/scale)."""
+    qmax = (1 << (bits - 1)) - 1
     w_f32 = w.float()
     row_max = w_f32.abs().amax(dim=1, keepdim=True).clamp(min=1e-12)
-    scales = row_max / 127.0
-    q = (w_f32 / scales).round().clamp(-128, 127).to(torch.int8)
+    scales = row_max / qmax
+    q = (w_f32 / scales).round().clamp(-qmax - 1, qmax).to(torch.int8)
     return q, scales.squeeze(1)
 
 
@@ -57,7 +77,8 @@ def free_gb(path) -> float:
 
 def scan_existing_output(out_dir: Path) -> set:
     """Tensor names already written to a *.safetensors file in out_dir --
-    header-only scan, cheap even against many GB of already-converted shards."""
+    header-only scan (safe_open doesn't load tensor data), so this is cheap
+    even against many GB of already-converted shards."""
     done = set()
     for shard in sorted(out_dir.glob("model-*.safetensors")):
         with safe_open(str(shard), framework="pt") as f:
@@ -66,10 +87,10 @@ def scan_existing_output(out_dir: Path) -> set:
 
 
 class OutputWriter:
-    """Buffers converted tensors and flushes into new model-NNNNN.safetensors
-    shard files once the buffer gets large -- st.h indexes every *.safetensors
-    file in a directory by scanning each one's own header, so any number of
-    arbitrarily-named shards works with no index.json needed."""
+    """Buffers converted tensors and flushes them into new model-NNNNN.safetensors
+    shard files once the buffer gets large -- qwen3moe.c's st.h indexes every
+    *.safetensors file in a directory by scanning each one's own header, so any
+    number of arbitrarily-named shards works with no index.json needed."""
 
     def __init__(self, out_dir: Path, flush_every: int = 512):
         self.out_dir = out_dir
@@ -92,10 +113,10 @@ class OutputWriter:
         self.shard_idx += 1
 
 
-def convert_expert(gate, up, down):
-    q_gate, s_gate = quantize_row(gate)
-    q_up, s_up = quantize_row(up)
-    q_down, s_down = quantize_row(down)
+def convert_expert(gate, up, down, bits):
+    q_gate, s_gate = quantize_row(gate, bits)
+    q_up, s_up = quantize_row(up, bits)
+    q_down, s_down = quantize_row(down, bits)
     merged_q = torch.cat([q_gate.flatten(), q_up.flatten(), q_down.flatten()])
     merged_s = torch.cat([s_gate, s_up, s_down])
     return merged_q, merged_s
@@ -109,9 +130,9 @@ def copy_metadata(src_dir: Path, out_dir: Path):
             shutil.copy2(p, out_dir / fn)
 
 
-# ---------- local / pre-downloaded path ----------
+# ---------- local / pre-downloaded path (also used by the tiny bench fixture) ----------
 
-def convert_local(src_dir: Path, out_dir: Path, flush_every: int):
+def convert_local(src_dir: Path, out_dir: Path, bits: int, flush_every: int):
     copy_metadata(src_dir, out_dir)
     shards = sorted(src_dir.glob("*.safetensors"))
     if not shards:
@@ -147,6 +168,7 @@ def convert_local(src_dir: Path, out_dir: Path, flush_every: int):
         else:
             dense_names.append(name)
 
+    n_skip_dense = sum(1 for n in dense_names if n in done)
     for name in dense_names:
         if name in done:
             continue
@@ -155,27 +177,30 @@ def convert_local(src_dir: Path, out_dir: Path, flush_every: int):
 
     n_total = len(experts)
     n_done = 0
+    n_skip_experts = 0
     for (layer, expert), projs in sorted(experts.items()):
         mw = f"model.layers.{layer}.mlp.experts.{expert}.merged_weight"
         if mw in done:
             n_done += 1
+            n_skip_experts += 1
             continue
         if not all(k in projs for k in ("gate_proj", "up_proj", "down_proj")):
             sys.exit(f"Missing projection for layer {layer} expert {expert}: have {list(projs)}")
         gate, up, down = get(projs["gate_proj"]), get(projs["up_proj"]), get(projs["down_proj"])
-        merged_q, merged_s = convert_expert(gate, up, down)
+        merged_q, merged_s = convert_expert(gate, up, down, bits)
         writer.add(mw, merged_q)
         writer.add(f"model.layers.{layer}.mlp.experts.{expert}.qs", merged_s)
         n_done += 1
         if n_done % 100 == 0 or n_done == n_total:
             print(f"  {n_done}/{n_total} experts converted...", flush=True)
     writer.flush()
-    print(f"Done: {n_total} experts, {len(dense_names)} dense tensors converted.")
+    print(f"Done: {n_total} experts, {len(dense_names)} dense tensors "
+          f"({n_skip_dense} dense + {n_skip_experts} experts already present, skipped).")
 
 
 # ---------- streaming --repo path: one source shard downloaded/converted/deleted at a time ----------
 
-def convert_streaming(repo: str, out_dir: Path, flush_every: int, min_free_gb: float):
+def convert_streaming(repo: str, out_dir: Path, bits: int, flush_every: int, min_free_gb: float):
     from huggingface_hub import HfApi, hf_hub_download
 
     info = HfApi().repo_info(repo, files_metadata=True)
@@ -194,7 +219,10 @@ def convert_streaming(repo: str, out_dir: Path, flush_every: int, min_free_gb: f
 
     done = scan_existing_output(out_dir)
     writer = OutputWriter(out_dir, flush_every)
-    pending_experts = {}   # (layer, expert) -> {proj: tensor}, freed once a triple completes
+    # (layer, expert) -> {proj: tensor}; entries here are only the projections
+    # whose sibling shard(s) haven't been seen yet -- freed the moment a triple
+    # completes and gets flushed, so this never approaches full-checkpoint size.
+    pending_experts = {}
 
     tmp = out_dir / "_inflight"
     tmp.mkdir(exist_ok=True)
@@ -223,7 +251,8 @@ def convert_streaming(repo: str, out_dir: Path, flush_every: int, min_free_gb: f
                 slot = pending_experts.setdefault(key, {})
                 slot[proj] = f.get_tensor(name)
                 if all(k in slot for k in ("gate_proj", "up_proj", "down_proj")):
-                    merged_q, merged_s = convert_expert(slot["gate_proj"], slot["up_proj"], slot["down_proj"])
+                    merged_q, merged_s = convert_expert(
+                        slot["gate_proj"], slot["up_proj"], slot["down_proj"], bits)
                     writer.add(mw, merged_q)
                     writer.add(f"model.layers.{layer}.mlp.experts.{expert}.qs", merged_s)
                     del pending_experts[key]
@@ -235,19 +264,24 @@ def convert_streaming(repo: str, out_dir: Path, flush_every: int, min_free_gb: f
     writer.flush()
     shutil.rmtree(tmp, ignore_errors=True)
     if pending_experts:
-        print(f"WARNING: {len(pending_experts)} experts never completed all 3 projections -- rerun to resume.")
+        print(f"WARNING: {len(pending_experts)} experts never completed all 3 projections "
+              f"(missing shards, or run stopped early on low disk space) -- rerun to resume.")
     else:
         print("DONE.")
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Convert OLMoE HF checkpoint -> colibri merged int8")
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     src = ap.add_mutually_exclusive_group(required=True)
-    src.add_argument("--repo", help="HuggingFace repo ID (streams+deletes one shard at a time)")
+    src.add_argument("--repo", help="HuggingFace repo ID, e.g. Qwen/Qwen3-30B-A3B "
+                                     "(streams+deletes one shard at a time)")
     src.add_argument("--model", help="Local HF checkpoint directory (already fully downloaded)")
-    ap.add_argument("--out", required=True, help="Output directory for merged model")
+    ap.add_argument("--out", required=True, help="Output directory for the colibri container")
+    ap.add_argument("--bits", type=int, default=8, choices=range(2, 9), metavar="[2-8]",
+                     help="quantization bits for expert weights (default 8; use 4 for the ~15GB "
+                          "real-checkpoint footprint once int8 has validated correctness)")
     ap.add_argument("--flush-every", type=int, default=512,
-                     help="flush an output shard every N converted tensors")
+                     help="flush an output shard every N converted tensors (bounds RAM/disk-buffer)")
     ap.add_argument("--min-free-gb", type=float, default=5.0,
                      help="--repo only: stop (resumably) if free space drops below this")
     args = ap.parse_args()
@@ -256,9 +290,9 @@ def main():
     out_dir.mkdir(parents=True, exist_ok=True)
 
     if args.model:
-        convert_local(Path(args.model), out_dir, args.flush_every)
+        convert_local(Path(args.model), out_dir, args.bits, args.flush_every)
     else:
-        convert_streaming(args.repo, out_dir, args.flush_every, args.min_free_gb)
+        convert_streaming(args.repo, out_dir, args.bits, args.flush_every, args.min_free_gb)
 
 
 if __name__ == "__main__":

@@ -330,8 +330,11 @@ cuda-bench: backend_cuda.cu backend_cuda.h backend_gpu_compat.h tests/bench_tens
 	"$(GPUCC)" $(GPUFLAGS) backend_cuda.cu tests/bench_tensor_core.cu -o backend_cuda_bench$(EXE)
 	./backend_cuda_bench$(EXE)
 
-olmoe$(EXE): olmoe.c st.h json.h compat.h
+olmoe$(EXE): olmoe.c st.h json.h compat.h sample.h tok.h tok_unicode.h tok_unicode_o200k.h
 	$(CC) $(CFLAGS) olmoe.c -o olmoe$(EXE) $(LDFLAGS)
+
+qwen3moe$(EXE): qwen3moe.c st.h json.h compat.h sample.h tok.h tok_unicode.h tok_unicode_o200k.h
+	$(CC) $(CFLAGS) qwen3moe.c -o qwen3moe$(EXE) $(LDFLAGS)
 
 # Use a baseline that matches the compiler target. macOS already targets a
 # portable baseline when ARCH is empty; forcing the x86 value there breaks

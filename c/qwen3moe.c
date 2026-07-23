@@ -1,6 +1,8 @@
-/* Motore di inferenza OLMoE in C puro, con EXPERT-STREAMING dal disco.
- * Porting del motore Python (engine.py). Obiettivo Stadio A: produrre gli STESSI
- * token id del riferimento (ref.json) -> valida il core prima di scalare a GLM-5.2.
+/* Qwen3-30B-A3B inference engine in pure C, with EXPERT-STREAMING from disk.
+ * Forked from olmoe.c: same disk-streaming/quant/LRU-cache skeleton, but with
+ * GQA attention (32 query heads / 4 KV heads, explicit head_dim=128 that does
+ * NOT equal hidden/n_heads) and per-head QK-RMSNorm before RoPE, instead of
+ * OLMoE's plain MHA-shaped attention and whole-vector QK-norm.
  *
  * Densa (embed, attn, router, norme, lm_head) residente in RAM (float32).
  * Expert letti dal disco on-demand via pread+fadvise(DONTNEED), cache LRU per-layer.
@@ -40,11 +42,11 @@
 /* ---------- config ---------- */
 typedef struct {
     int hidden, n_layers, n_heads, n_kv_heads, head_dim;
-    int n_experts, topk, inter, vocab;
+    int n_experts, topk, moe_inter, vocab;
     float theta, eps; int norm_topk;
-    int stop_ids[8], n_stop;   /* unused (no model-specific hardcoded stops) — chat mode's
-                                 * stop set comes entirely from the tokenizer's own special-
-                                 * token flags via sample.h's stops_arm_tok */
+    int stop_ids[8], n_stop;   /* unused (no model-specific hardcoded stops for Qwen3 —
+                                 * chat mode's stop set comes entirely from the tokenizer's
+                                 * own special-token flags via sample.h's stops_arm_tok) */
 } Cfg;
 
 /* ---------- pesi densi per-layer ---------- */
@@ -121,11 +123,12 @@ static double rss_gb(void) { struct rusage r; getrusage(RUSAGE_SELF, &r); return
 static float *falloc(int64_t n) { float *p = malloc(n*sizeof(float)); if(!p){fprintf(stderr,"OOM %ld\n",(long)n);exit(1);} return p; }
 
 /* chat mode only (main()'s CHAT=1 path): sampling temperature/top-p and the
- * tokenizer + stop-set machinery. g_temp<=0 -> greedy (sample.h's pick_tok).
- * Declared before #include "sample.h" — it references these by name, and
- * Cfg/falloc above, without its own extern declarations. */
-static float g_temp = 0.7f;   /* TEMP env overrides */
-static float g_nuc  = 0.95f;  /* NUCLEUS env overrides */
+ * tokenizer + stop-set machinery. g_temp<=0 -> greedy (sample.h's pick_tok),
+ * matching the greedy decoding the tiny-model and real-checkpoint validation
+ * runs used. Declared before #include "sample.h" — it references these by
+ * name, and Cfg/falloc above, without its own extern declarations. */
+static float g_temp = 0.6f;   /* TEMP env overrides; Qwen3's own generation_config default */
+static float g_nuc  = 0.95f;  /* NUCLEUS env overrides; ditto (top_p in generation_config.json) */
 #include "sample.h"
 
 /* y[S,O] = x[S,I] @ W^T,  W e' [O,I] row-major */
@@ -160,30 +163,9 @@ static inline int32_t dot_i8_16(const int8_t *a, const int8_t *b) {
 #endif
     return vaddvq_s32(acc);
 }
-#define HAVE_FAST_DOT_I8 1
-#elif defined(__AVX2__)
-#include <immintrin.h>
-/* x86 counterpart of the NEON path above (was scalar-only here before —
- * the only fast path was ARM, so x86 boxes silently fell back to a byte-at-a-
- * time loop even when AVX2 was available, as it is on this machine).
- * Sign-extend both int8 vectors to int16 (exact, no precision loss) then
- * madd+horizontal-sum in int32: pure integer arithmetic, so this is
- * bit-for-bit identical to the scalar dot product, just vectorized. */
-static inline int32_t dot_i8_16(const int8_t *a, const int8_t *b) {
-    __m256i va16 = _mm256_cvtepi8_epi16(_mm_loadu_si128((const __m128i*)a));
-    __m256i vb16 = _mm256_cvtepi8_epi16(_mm_loadu_si128((const __m128i*)b));
-    __m256i prod = _mm256_madd_epi16(va16, vb16);           /* 8 x int32, adjacent pairs summed */
-    __m128i sum128 = _mm_add_epi32(_mm256_castsi256_si128(prod), _mm256_extracti128_si256(prod, 1));
-    __m128i hi64   = _mm_unpackhi_epi64(sum128, sum128);
-    __m128i sum64  = _mm_add_epi32(sum128, hi64);
-    __m128i hi32   = _mm_shuffle_epi32(sum64, _MM_SHUFFLE(2, 3, 0, 1));
-    __m128i sum32  = _mm_add_epi32(sum64, hi32);
-    return _mm_cvtsi128_si32(sum32);
-}
-#define HAVE_FAST_DOT_I8 1
 #endif
 static void matmul_q(float *y, const float *x, const int8_t *q, const float *scale, int I, int O) {
-#if defined(HAVE_FAST_DOT_I8)
+#if defined(__ARM_NEON)
     static int idot = -1;
     if (idot < 0) { const char *e = getenv("IDOT"); idot = !(e && *e == '0'); }
     if (idot && I % 16 == 0 && I <= 4096) {
@@ -255,6 +237,15 @@ static double req_num(jval *r, const char *k){
     if(!v||v->t!=J_NUM){ fprintf(stderr,"config.json: missing or non-numeric \"%s\"\n",k); exit(1); }
     return v->num;
 }
+/* HF has renamed/reshaped a few Qwen3MoeConfig keys across transformers versions
+ * (the real Qwen3-30B-A3B checkpoint uses the older flat names; a config.json
+ * re-serialized by a newer transformers uses the ones on the right) — accept
+ * either so load_cfg works against both. */
+static double req_num2(jval *r, const char *k, const char *k_alt){
+    jval *v=json_get(r,k);
+    if(v && v->t==J_NUM) return v->num;
+    return req_num(r,k_alt);
+}
 static void load_cfg(Cfg *c, const char *snap) {
     char path[2048]; snprintf(path, sizeof(path), "%s/config.json", snap);
     FILE *f = fopen(path, "rb"); if(!f){perror(path);exit(1);}
@@ -267,18 +258,27 @@ static void load_cfg(Cfg *c, const char *snap) {
     c->n_layers  = (int)req_num(r,"num_hidden_layers");
     c->n_heads   = (int)req_num(r,"num_attention_heads");
     c->n_kv_heads= (int)req_num(r,"num_key_value_heads");
-    c->n_experts = (int)req_num(r,"num_experts");
+    c->n_experts = (int)req_num2(r,"num_experts","num_local_experts");
     c->topk      = (int)req_num(r,"num_experts_per_tok");
-    c->inter     = (int)req_num(r,"intermediate_size");
+    c->moe_inter = (int)req_num(r,"moe_intermediate_size");
     c->vocab     = (int)req_num(r,"vocab_size");
-    /* range-check so bad dims can't drive a later malloc(inter*hidden) / div-by-zero */
+    /* Qwen3 sets head_dim explicitly and it is NOT hidden/n_heads (e.g. 32
+     * heads * 128 head_dim = 4096 != hidden_size 2048) — never derive it. */
+    c->head_dim  = (int)req_num(r,"head_dim");
+    /* range-check so bad dims can't drive a later malloc(moe_inter*hidden) / div-by-zero */
     if(c->hidden<1||c->hidden>(1<<20) || c->n_heads<1||c->n_heads>(1<<16) ||
-       c->inter<1||c->inter>(1<<24) || c->vocab<1||c->vocab>(1<<24) ||
+       c->moe_inter<1||c->moe_inter>(1<<24) || c->vocab<1||c->vocab>(1<<24) ||
        c->n_layers<1||c->n_layers>4096 || c->n_experts<1||c->n_experts>(1<<20) ||
-       c->n_kv_heads<1 || c->topk<1||c->topk>c->n_experts){
-        fprintf(stderr,"config.json: dimension out of range\n"); exit(1); }
-    c->head_dim  = c->hidden / c->n_heads;
-    jval *th = json_get(r,"rope_theta");  c->theta = th ? (float)th->num : 10000.f;
+       c->n_kv_heads<1 || c->topk<1||c->topk>c->n_experts ||
+       c->head_dim<1||c->head_dim>(1<<16) ||
+       c->n_heads % c->n_kv_heads != 0){
+        fprintf(stderr,"config.json: dimension out of range (or n_heads not a multiple of n_kv_heads)\n"); exit(1); }
+    /* rope_theta is a flat top-level key in the real Qwen3-30B-A3B checkpoint's
+     * config.json, but a config.json re-serialized by a newer transformers nests
+     * it under "rope_parameters": {"rope_theta": ...} -- check both. */
+    jval *th = json_get(r,"rope_theta");
+    if (!th) { jval *rp = json_get(r,"rope_parameters"); if (rp) th = json_get(rp,"rope_theta"); }
+    c->theta = th ? (float)th->num : 10000.f;
     jval *ep = json_get(r,"rms_norm_eps"); c->eps   = ep ? (float)ep->num : 1e-5f;
     jval *nt = json_get(r,"norm_topk_prob"); c->norm_topk = (nt && nt->t==J_BOOL) ? nt->boolean : 0;
     free(buf); free(arena);
@@ -384,8 +384,8 @@ static void model_init(Model *m, const char *snap, int cap, int bits) {
 static void slot_ensure_allocated(Model *m, Slot *s) {
     if (s->g) return;
     Cfg *c = &m->c;
-    int64_t ng = (int64_t)c->inter * c->hidden;
-    int64_t nd = (int64_t)c->hidden * c->inter;
+    int64_t ng = (int64_t)c->moe_inter * c->hidden;
+    int64_t nd = (int64_t)c->hidden * c->moe_inter;
     int8_t *w_block = malloc(ng + ng + nd);
     if (!w_block) {
         fprintf(stderr, "Error: Out of memory allocating slot weights block\n");
@@ -394,10 +394,10 @@ static void slot_ensure_allocated(Model *m, Slot *s) {
     s->g = w_block;
     s->u = w_block + ng;
     s->d = w_block + ng + ng;
-    float *s_block = falloc(c->inter + c->inter + c->hidden);
+    float *s_block = falloc(c->moe_inter + c->moe_inter + c->hidden);
     s->gs = s_block;
-    s->us = s_block + c->inter;
-    s->ds = s_block + c->inter + c->inter;
+    s->us = s_block + c->moe_inter;
+    s->ds = s_block + c->moe_inter + c->moe_inter;
     s->pinned = 0;
 }
 
@@ -413,14 +413,14 @@ static void load_expert_merged(Model *m, int layer, int eid, Slot *s) {
      * inter+inter+hidden floats, so require an exact match. Reject, never
      * repair — same contract as qt_resolve_fmt in the GLM engine. */
     Cfg *cc = &m->c;
-    int64_t ng = (int64_t)cc->inter * cc->hidden, nd = (int64_t)cc->hidden * cc->inter;
+    int64_t ng = (int64_t)cc->moe_inter * cc->hidden, nd = (int64_t)cc->hidden * cc->moe_inter;
     int64_t want_w = ng + ng + nd;
-    int64_t want_s = (int64_t)cc->inter + cc->inter + cc->hidden;
+    int64_t want_s = (int64_t)cc->moe_inter + cc->moe_inter + cc->hidden;
     st_tensor *tw = st_find(&m->S, nm), *ts = st_find(&m->S, qsnm);
     if (!tw || tw->nbytes != want_w) {
-        fprintf(stderr, "%s: expert weight is %lld bytes — expected %lld for [inter=%d,hidden=%d], "
+        fprintf(stderr, "%s: expert weight is %lld bytes — expected %lld for [moe_inter=%d,hidden=%d], "
                 "refusing (untrusted container)\n", nm, (long long)(tw ? tw->nbytes : -1),
-                (long long)want_w, cc->inter, cc->hidden); exit(1); }
+                (long long)want_w, cc->moe_inter, cc->hidden); exit(1); }
     if (!ts || ts->numel != want_s) {
         fprintf(stderr, "%s: scale array is %lld elems — expected %lld, refusing (untrusted container)\n",
                 qsnm, (long long)(ts ? ts->numel : -1), (long long)want_s); exit(1); }
@@ -565,58 +565,72 @@ static void rope_head(float *x, int pos, const Cfg *c) {
     }
 }
 
-/* attenzione sui token nuovi x[S,hidden]; pos_base = posizione assoluta del primo token nuovo */
+/* attenzione sui token nuovi x[S,hidden]; pos_base = posizione assoluta del primo token nuovo.
+ * GQA: H query head, KVH<H key/value head (gruppo di size G=H/KVH condivide la stessa KV).
+ * Dq=H*hd e Dkv=KVH*hd NON coincidono con D=hidden (Qwen3: 32*128=4096, 4*128=512, hidden=2048) —
+ * mai assumere Dq==Dkv==D come faceva olmoe.c (li' vero perche' n_kv_heads==n_heads li'). */
 static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_base, float *out) {
-    Cfg *c = &m->c; int H = c->n_heads, hd = c->head_dim, D = c->hidden;
-    float *q = falloc((int64_t)S*D), *k = falloc((int64_t)S*D), *vv = falloc((int64_t)S*D);
-    matmul(q, x, l->q, S, D, D);
-    matmul(k, x, l->k, S, D, D);
-    matmul(vv, x, l->v, S, D, D);
-    /* qk-norm sull'intero vettore hidden, poi RoPE per testa */
+    Cfg *c = &m->c;
+    int H = c->n_heads, KVH = c->n_kv_heads, hd = c->head_dim, D = c->hidden;
+    int Dq = H*hd, Dkv = KVH*hd, G = H/KVH;   /* G: query heads per kv head (load_cfg garantisce H%KVH==0) */
+    float *q = falloc((int64_t)S*Dq), *k = falloc((int64_t)S*Dkv), *vv = falloc((int64_t)S*Dkv);
+    matmul(q, x, l->q, S, D, Dq);
+    matmul(k, x, l->k, S, D, Dkv);
+    matmul(vv, x, l->v, S, D, Dkv);
+    /* qk-norm PER TESTA (l->qn/l->kn sono lunghi hd, condivisi da ogni testa), poi RoPE sulla
+     * stessa fetta — l'ordine conta: norm prima, rotazione dopo, mai il contrario. */
     for (int s = 0; s < S; s++) {
-        rmsnorm_row(q + (int64_t)s*D, q + (int64_t)s*D, l->qn, D, c->eps);
-        rmsnorm_row(k + (int64_t)s*D, k + (int64_t)s*D, l->kn, D, c->eps);
         int pos = pos_base + s;
-        for (int hh = 0; hh < H; hh++) { rope_head(q + (int64_t)s*D + hh*hd, pos, c); rope_head(k + (int64_t)s*D + hh*hd, pos, c); }
+        for (int hh = 0; hh < H; hh++) {
+            float *qh = q + (int64_t)s*Dq + hh*hd;
+            rmsnorm_row(qh, qh, l->qn, hd, c->eps);
+            rope_head(qh, pos, c);
+        }
+        for (int hh = 0; hh < KVH; hh++) {
+            float *kh = k + (int64_t)s*Dkv + hh*hd;
+            rmsnorm_row(kh, kh, l->kn, hd, c->eps);
+            rope_head(kh, pos, c);
+        }
     }
-    /* scrive k,v nella kv-cache alle posizioni pos_base..pos_base+S-1 */
-    for (int s = 0; s < S; s++) for (int hh = 0; hh < H; hh++) {
+    /* scrive k,v nella kv-cache (dimensionata per KVH, non H) alle posizioni pos_base..pos_base+S-1 */
+    for (int s = 0; s < S; s++) for (int hh = 0; hh < KVH; hh++) {
         int t = pos_base + s;
-        memcpy(m->K[layer] + ((int64_t)hh*m->max_t + t)*hd, k + (int64_t)s*D + hh*hd, hd*sizeof(float));
-        memcpy(m->V[layer] + ((int64_t)hh*m->max_t + t)*hd, vv + (int64_t)s*D + hh*hd, hd*sizeof(float));
+        memcpy(m->K[layer] + ((int64_t)hh*m->max_t + t)*hd, k + (int64_t)s*Dkv + hh*hd, hd*sizeof(float));
+        memcpy(m->V[layer] + ((int64_t)hh*m->max_t + t)*hd, vv + (int64_t)s*Dkv + hh*hd, hd*sizeof(float));
     }
     int Tk = pos_base + S;             /* numero di key totali disponibili */
     float scale = 1.f / sqrtf((float)hd);
-    float *ctx = falloc((int64_t)S*D);
+    float *ctx = falloc((int64_t)S*Dq);
     #pragma omp parallel for collapse(2) schedule(static)
     for (int hh = 0; hh < H; hh++) {
         for (int s = 0; s < S; s++) {
             int qpos = pos_base + s;
-            const float *qv = q + (int64_t)s*D + hh*hd;
+            int kvh = hh / G;                          /* GQA: mappa la query head al suo gruppo kv */
+            const float *qv = q + (int64_t)s*Dq + hh*hd;
             float sc[4096];
             for (int t = 0; t <= qpos; t++) {          /* causale: t <= qpos */
-                const float *kv = m->K[layer] + ((int64_t)hh*m->max_t + t)*hd;
+                const float *kv = m->K[layer] + ((int64_t)kvh*m->max_t + t)*hd;
                 float acc = 0; for (int dd = 0; dd < hd; dd++) acc += qv[dd]*kv[dd];
                 sc[t] = acc * scale;
             }
             softmax_row(sc, qpos+1);
-            float *cx = ctx + (int64_t)s*D + hh*hd;
+            float *cx = ctx + (int64_t)s*Dq + hh*hd;
             for (int dd = 0; dd < hd; dd++) cx[dd] = 0;
             for (int t = 0; t <= qpos; t++) {
-                const float *vrow = m->V[layer] + ((int64_t)hh*m->max_t + t)*hd;
+                const float *vrow = m->V[layer] + ((int64_t)kvh*m->max_t + t)*hd;
                 float a = sc[t];
                 for (int dd = 0; dd < hd; dd++) cx[dd] += a * vrow[dd];
             }
         }
     }
     (void)Tk;
-    matmul(out, ctx, l->o, S, D, D);
+    matmul(out, ctx, l->o, S, Dq, D);
     free(q); free(k); free(vv); free(ctx);
 }
 
 /* MoE sui token x[S,hidden] -> out[S,hidden] */
 static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
-    Cfg *c = &m->c; int D = c->hidden, E = c->n_experts, K = c->topk, I = c->inter;
+    Cfg *c = &m->c; int D = c->hidden, E = c->n_experts, K = c->topk, I = c->moe_inter;
     float *logits = falloc((int64_t)S*E);
     matmul(logits, x, l->gate, S, D, E);
     memset(out, 0, (int64_t)S*D*sizeof(float));
@@ -910,8 +924,8 @@ static void generate(Model *m, const int *prompt, int np, int n_new, int *out) {
     m->max_t = np + n_new;
     m->K = calloc(c->n_layers, sizeof(float*)); m->V = calloc(c->n_layers, sizeof(float*));
     for (int i = 0; i < c->n_layers; i++) {
-        m->K[i] = falloc((int64_t)c->n_heads * m->max_t * c->head_dim);
-        m->V[i] = falloc((int64_t)c->n_heads * m->max_t * c->head_dim);
+        m->K[i] = falloc((int64_t)c->n_kv_heads * m->max_t * c->head_dim);
+        m->V[i] = falloc((int64_t)c->n_kv_heads * m->max_t * c->head_dim);
     }
     for (int i = 0; i < np; i++) out[i] = prompt[i];
     float *logit = step(m, prompt, np, 0);          /* PREFILL */
@@ -938,8 +952,8 @@ static int tf_nll(Model *m, const int *full, int nfull, int np, double *nll_out)
     m->max_t = nfull;
     m->K = calloc(c->n_layers, sizeof(float*)); m->V = calloc(c->n_layers, sizeof(float*));
     for (int i = 0; i < c->n_layers; i++) {
-        m->K[i] = falloc((int64_t)c->n_heads * m->max_t * c->head_dim);
-        m->V[i] = falloc((int64_t)c->n_heads * m->max_t * c->head_dim);
+        m->K[i] = falloc((int64_t)c->n_kv_heads * m->max_t * c->head_dim);
+        m->V[i] = falloc((int64_t)c->n_kv_heads * m->max_t * c->head_dim);
     }
     double nll = 0; int scored = 0;
     float *logit = step(m, full, np, 0);              /* prefill on the prompt */
@@ -959,40 +973,34 @@ static int tf_nll(Model *m, const int *full, int nfull, int np, double *nll_out)
 }
 
 /* ---------- interactive chat mode (CHAT=1) ---------- */
-/* OLMoE-Instruct's real template (tokenizer_config.json's chat_template):
- *   {{bos_token}}<|user|>\n{msg}\n<|assistant|>\n{reply}{eos_token}\n<|user|>\n...
- * bos_token == eos_token == "|||IP_ADDRESS|||" (a genuine OLMoE tokenizer quirk,
- * a PII-scrubbing artifact repurposed as the BOS/EOS marker — not a bug here).
- * It's an added special token (id 50279 in this checkpoint), so tok_encode()
- * tokenizes the literal string as one atomic id, same as any other added token.
- * <|user|>/<|assistant|> are NOT special tokens in this tokenizer — just plain
- * text the model was trained to treat as turn markers.
- * Turn 1 gets bos_token with no separator before "<|user|>"; every later turn
- * gets eos_token+"\n" first (closing the previous assistant turn we never
- * explicitly appended to history, matching the is_stop-skips-append design
- * below) before its own "<|user|>...". */
-static int fmt_user_turn(char *out, int cap, const char *msg, int first_turn) {
-    int n = first_turn
-        ? snprintf(out, cap, "|||IP_ADDRESS|||<|user|>\n%s\n<|assistant|>\n", msg)
-        : snprintf(out, cap, "|||IP_ADDRESS|||\n<|user|>\n%s\n<|assistant|>\n", msg);
+/* ChatML turn wrapper — Qwen3's real template, confirmed against the tokenizer's
+ * own <|im_start|>/<|im_end|> special tokens (id 151644/151645, both marked
+ * "special": true in tokenizer_config.json, so sample.h's stops_arm_tok arms
+ * <|im_end|> as a hard stop automatically — no hardcoded ids needed here).
+ * No system-turn support in this first cut: every turn is a plain user/assistant
+ * exchange. <think>...</think> is NOT a stop token (marked "special": false —
+ * real content) so reasoning output prints through like any other text. */
+static int fmt_user_turn(char *out, int cap, const char *msg) {
+    int n = snprintf(out, cap, "<|im_start|>user\n%s<|im_end|>\n<|im_start|>assistant\n", msg);
     return (n < 0 || n >= cap) ? -1 : n;
 }
 
-/* KV cache allocated ONCE for ctx_cap and never reallocated — hist_len only
+/* KV cache is allocated ONCE for ctx_cap and never reallocated — hist_len only
  * grows (or resets to 0 on /reset), so every turn after the first reuses the
- * previous turns' cached keys/values: real multi-turn context, not a fresh
- * generate() call per message. ctx_cap capped at 4096: attention()'s per-head
- * score buffer (sc[4096]) is fixed-size, any position >= 4096 would overflow it. */
+ * previous turns' cached keys/values instead of re-processing them: real
+ * multi-turn context, not a fresh generate() call per message.
+ * ctx_cap is capped at 4096 by the caller: attention()'s per-head score buffer
+ * (sc[4096]) is fixed-size, so any absolute position >= 4096 would overflow it. */
 static void run_chat(Model *m, Tok *T, int ctx_cap) {
     Cfg *c = &m->c;
     m->max_t = ctx_cap;
     m->K = calloc(c->n_layers, sizeof(float*)); m->V = calloc(c->n_layers, sizeof(float*));
     for (int i = 0; i < c->n_layers; i++) {
-        m->K[i] = falloc((int64_t)c->n_heads * m->max_t * c->head_dim);
-        m->V[i] = falloc((int64_t)c->n_heads * m->max_t * c->head_dim);
+        m->K[i] = falloc((int64_t)c->n_kv_heads * m->max_t * c->head_dim);
+        m->V[i] = falloc((int64_t)c->n_kv_heads * m->max_t * c->head_dim);
     }
 
-    int tok_eos = tok_id_of(T, "|||IP_ADDRESS|||");
+    int tok_eos = tok_id_of(T, "<|im_end|>");
     stops_arm_tok(c, tok_eos, T);
 
     int max_new = getenv("MAX_NEW") ? atoi(getenv("MAX_NEW")) : 512;
@@ -1000,7 +1008,6 @@ static void run_chat(Model *m, Tok *T, int ctx_cap) {
 
     int *hist = malloc((size_t)ctx_cap * sizeof(int));
     int hist_len = 0;
-    int first_turn = 1;
 
     char *line = malloc(8192);
     char *turn = malloc(8192 + 64);
@@ -1008,7 +1015,7 @@ static void run_chat(Model *m, Tok *T, int ctx_cap) {
     int  *gen = malloc((size_t)max_new * sizeof(int));
     char *outbuf = malloc(65536);
 
-    fprintf(stderr, "olmoe chat — SNAP=%s, ctx=%d, TEMP=%.2f, NUCLEUS=%.2f\n"
+    fprintf(stderr, "qwen3moe chat — SNAP=%s, ctx=%d, TEMP=%.2f, NUCLEUS=%.2f\n"
                      "  type a message and press enter; /reset clears context; Ctrl-D exits\n",
             getenv("SNAP"), ctx_cap, g_temp, g_nuc);
 
@@ -1018,11 +1025,10 @@ static void run_chat(Model *m, Tok *T, int ctx_cap) {
         size_t L = strlen(line);
         while (L > 0 && (line[L-1] == '\n' || line[L-1] == '\r')) line[--L] = 0;
         if (L == 0) continue;
-        if (!strcmp(line, "/reset")) { hist_len = 0; first_turn = 1; fprintf(stderr, "[chat] context reset\n"); continue; }
+        if (!strcmp(line, "/reset")) { hist_len = 0; fprintf(stderr, "[chat] context reset\n"); continue; }
 
-        int tn = fmt_user_turn(turn, 8192 + 64, line, first_turn);
+        int tn = fmt_user_turn(turn, 8192 + 64, line);
         if (tn < 0) { fprintf(stderr, "[chat] message too long, skipped\n"); continue; }
-        first_turn = 0;
         int nn = tok_encode(T, turn, tn, newids, 8192);
 
         if (hist_len + nn + max_new > ctx_cap) {
